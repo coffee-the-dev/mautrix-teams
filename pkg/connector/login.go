@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -34,8 +35,11 @@ const (
 	LoginFlowIDDeviceCode         = "device_code"
 	LoginFlowIDDeviceCodeTenant   = "device_code_tenant"
 	LoginFlowIDDeviceCodePersonal = "device_code_personal"
+	LoginFlowIDAuthCode           = "auth_code"
+	LoginFlowIDAuthCodePersonal   = "auth_code_personal"
 	LoginStepIDTenantPrompt       = "fi.mau.teams.login.tenant"
 	LoginStepIDDeviceCodePrompt   = "fi.mau.teams.login.device_code"
+	LoginStepIDAuthCodePrompt     = "fi.mau.teams.login.auth_code"
 	LoginStepIDComplete           = "fi.mau.teams.login.complete"
 )
 
@@ -56,6 +60,16 @@ func (tc *TeamsConnector) GetLoginFlows() []bridgev2.LoginFlow {
 			Description: "Log in with a personal account (Outlook.com, Hotmail, Live) as used by Teams free. Microsoft signs these in through a different app, so pick this flow for them.",
 			ID:          LoginFlowIDDeviceCodePersonal,
 		},
+		{
+			Name:        "Work or school account (browser sign-in)",
+			Description: "Like the work or school flow, but signs in interactively in your browser instead of through a device code. Use this when the organisation blocks device-code logins.",
+			ID:          LoginFlowIDAuthCode,
+		},
+		{
+			Name:        "Personal Microsoft account (browser sign-in)",
+			Description: "Like the personal flow, but signs in interactively in your browser instead of through a device code.",
+			ID:          LoginFlowIDAuthCodePersonal,
+		},
 	}
 }
 
@@ -67,6 +81,10 @@ func (tc *TeamsConnector) CreateLogin(ctx context.Context, user *bridgev2.User, 
 		return &TeamsDeviceCodeLogin{connector: tc, User: user, askForTenant: true}, nil
 	case LoginFlowIDDeviceCodePersonal:
 		return &TeamsDeviceCodeLogin{connector: tc, User: user, personal: true}, nil
+	case LoginFlowIDAuthCode:
+		return &TeamsAuthCodeLogin{connector: tc, User: user, personal: false}, nil
+	case LoginFlowIDAuthCodePersonal:
+		return &TeamsAuthCodeLogin{connector: tc, User: user, personal: true}, nil
 	}
 	return nil, fmt.Errorf("unknown login flow %q", flowID)
 }
@@ -166,7 +184,14 @@ func (l *TeamsDeviceCodeLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, e
 	if err != nil {
 		return nil, fmt.Errorf("poll device code: %w", err)
 	}
+	return completeTeamsLogin(ctx, l.User, l.personal, tok)
+}
 
+// completeTeamsLogin turns OAuth tokens into a connected user login. Shared by
+// the device-code and browser (authorization-code) login flows; the personal
+// account's MRI comes from the Skype authz response, a work account's from the
+// id_token's oid claim.
+func completeTeamsLogin(ctx context.Context, user *bridgev2.User, personal bool, tok *msteams.DeviceCodeToken) (*bridgev2.LoginStep, error) {
 	claims, err := msteams.ParseIDToken(tok.IDToken)
 	if err != nil {
 		return nil, fmt.Errorf("parse id_token: %w", err)
@@ -174,19 +199,18 @@ func (l *TeamsDeviceCodeLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, e
 	if claims.TenantID == "" || claims.ObjectID == "" {
 		return nil, fmt.Errorf("id_token missing tid/oid claims")
 	}
-	// A personal account's MRI comes from the authz response below.
 	mri := ""
-	if !l.personal {
+	if !personal {
 		mri = "8:orgid:" + claims.ObjectID
 	}
 
 	client, err := msteams.NewClient(msteams.ClientConfig{
-		Personal:     l.personal,
+		Personal:     personal,
 		TenantID:     claims.TenantID,
 		UserMRI:      mri,
 		AuthToken:    tok.AccessToken,
 		RefreshToken: tok.RefreshToken,
-		Logger:       l.User.Log,
+		Logger:       user.Log,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct client: %w", err)
@@ -197,7 +221,7 @@ func (l *TeamsDeviceCodeLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, e
 	}
 	_, skype := client.SnapshotTokens()
 	chatSvc := client.ChatSvcBase()
-	if l.personal {
+	if personal {
 		mri = "8:" + client.SkypeID()
 	}
 	_ = client.Close()
@@ -215,7 +239,7 @@ func (l *TeamsDeviceCodeLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, e
 		}
 	}
 
-	ul, err := l.User.NewLogin(ctx, &database.UserLogin{
+	ul, err := user.NewLogin(ctx, &database.UserLogin{
 		ID:         teamsid.MakeUserLoginID(mri),
 		RemoteName: remoteName,
 		Metadata: &UserLoginMetadata{
@@ -247,3 +271,63 @@ func (l *TeamsDeviceCodeLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, e
 		},
 	}, nil
 }
+
+// TeamsAuthCodeLogin signs the user in interactively in their browser through
+// an authorization-code + PKCE flow, for tenants whose Conditional Access
+// policies block the device-code grant.
+type TeamsAuthCodeLogin struct {
+	connector *TeamsConnector
+	User      *bridgev2.User
+	personal  bool
+
+	verifier string
+}
+
+var _ bridgev2.LoginProcessUserInput = (*TeamsAuthCodeLogin)(nil)
+
+func (l *TeamsAuthCodeLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
+	verifier, err := msteams.NewAuthCodeVerifier()
+	if err != nil {
+		return nil, fmt.Errorf("generate PKCE verifier: %w", err)
+	}
+	l.verifier = verifier
+	loginURL := msteams.AuthCodeURL("", l.personal, verifier)
+	return &bridgev2.LoginStep{
+		Type: bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepIDAuthCodePrompt,
+		Instructions: fmt.Sprintf(
+			"Open %s in a browser, sign in with your Microsoft account, and when the browser lands on a blank page afterwards, copy the full URL from the address bar and paste it here.",
+			loginURL,
+		),
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				Type:        bridgev2.LoginInputFieldTypeURL,
+				ID:          "redirect_url",
+				Name:        "Redirect URL",
+				Description: "The address-bar URL after signing in (starts with https://login.microsoftonline.com/common/oauth2/nativeclient)",
+			}},
+		},
+	}, nil
+}
+
+func (l *TeamsAuthCodeLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
+	raw := strings.TrimSpace(input["redirect_url"])
+	if raw == "" {
+		return nil, fmt.Errorf("no redirect URL provided")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse redirect URL: %w", err)
+	}
+	code := parsed.Query().Get("code")
+	if code == "" {
+		return nil, fmt.Errorf("redirect URL has no ?code= parameter")
+	}
+	tok, err := msteams.ExchangeAuthCode(ctx, http.DefaultClient, "", l.personal, code, l.verifier)
+	if err != nil {
+		return nil, fmt.Errorf("exchange auth code: %w", err)
+	}
+	return completeTeamsLogin(ctx, l.User, l.personal, tok)
+}
+
+func (l *TeamsAuthCodeLogin) Cancel() {}

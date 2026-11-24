@@ -17,6 +17,8 @@ package msteams
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -819,4 +821,96 @@ func (c *Client) ensureFreshTokens(ctx context.Context, needBearer, needSkype bo
 		}
 	}
 	return nil
+}
+
+// NewAuthCodeVerifier returns a random PKCE code verifier (RFC 7636).
+func NewAuthCodeVerifier() (string, error) {
+	buf := make([]byte, 48)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// authCodeRedirectURI is the standard "native client" redirect page: after
+// signing in, the browser lands on a blank page whose URL contains ?code=...,
+// which the user copies back into the bridge.
+const authCodeRedirectURI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
+
+// AuthCodeURL builds an interactive authorization-code + PKCE sign-in URL for
+// the Teams clients. Use this instead of the device-code flow when the
+// tenant's Conditional Access policies block device-code grants but allow the
+// same interactive browser sign-in the Teams web client itself performs.
+func AuthCodeURL(tenant string, personal bool, verifier string) string {
+	switch {
+	case personal:
+		tenant = "consumers"
+	case tenant == "":
+		tenant = "organizations"
+	}
+	scope := workOAuthScope
+	if personal {
+		scope = personalOAuthScope
+	}
+	sum := sha256.Sum256([]byte(verifier))
+	q := url.Values{}
+	q.Set("client_id", oauthClientID(personal))
+	q.Set("response_type", "code")
+	q.Set("redirect_uri", authCodeRedirectURI)
+	q.Set("scope", scope)
+	q.Set("code_challenge", base64.RawURLEncoding.EncodeToString(sum[:]))
+	q.Set("code_challenge_method", "S256")
+	return fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/authorize?%s", tenant, q.Encode())
+}
+
+// ExchangeAuthCode swaps an authorization code (taken from the redirect URL
+// the user pasted) for OAuth tokens, proving possession of the PKCE verifier
+// used when the sign-in URL was generated.
+func ExchangeAuthCode(ctx context.Context, httpClient *http.Client, tenant string, personal bool, code, verifier string) (*DeviceCodeToken, error) {
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	switch {
+	case personal:
+		tenant = "consumers"
+	case tenant == "":
+		tenant = "organizations"
+	}
+	scope := workOAuthScope
+	if personal {
+		scope = personalOAuthScope
+	}
+	form := url.Values{}
+	form.Set("client_id", oauthClientID(personal))
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("redirect_uri", authCodeRedirectURI)
+	form.Set("scope", scope)
+	form.Set("code_verifier", verifier)
+	endpoint := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenant)
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, tokenResponseLimit))
+	var out oauthTokenResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("decode token response (%d): %w", resp.StatusCode, err)
+	}
+	if out.AccessToken == "" {
+		return nil, fmt.Errorf("token endpoint: %s: %s", out.Error, out.ErrorDesc)
+	}
+	return &DeviceCodeToken{
+		AccessToken:  out.AccessToken,
+		RefreshToken: out.RefreshToken,
+		IDToken:      out.IDToken,
+		ExpiresAt:    time.Now().Add(time.Duration(out.ExpiresIn) * time.Second),
+	}, nil
 }
