@@ -1,6 +1,6 @@
 FROM docker.io/library/golang:1.26-alpine AS build
 
-RUN apk add --no-cache git olm-dev
+RUN apk add --no-cache git gcc musl-dev olm-dev
 WORKDIR /src
 COPY . .
 ARG TARGETARCH
