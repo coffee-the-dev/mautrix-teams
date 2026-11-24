@@ -19,6 +19,7 @@ package connector
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -711,6 +712,16 @@ func (t *TeamsClient) convertIncomingMessage(
 		}}}, nil
 	}
 	content := msteams.ReplaceInlineEmojis(data.Content)
+	if data.MessageType == "RichText/Media_Card" {
+		// shortcut: card payload captured for building the card-to-text
+		// converter; remove once adaptive card rendering exists.
+		if props, err := json.Marshal(data.Properties); err == nil {
+			t.UserLogin.Log.Debug().
+				Str("content", data.Content).
+				Str("properties", string(props)).
+				Msg("Teams card message")
+		}
+	}
 	parts := t.convertAttachments(ctx, intent, content)
 	parts = append(parts, t.convertSharedFiles(ctx, intent, data.SharedFiles)...)
 
