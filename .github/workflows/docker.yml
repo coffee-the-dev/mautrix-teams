@@ -84,14 +84,18 @@ jobs:
       - name: Create multi-arch manifest
         working-directory: /tmp/digests
         run: |
+          ls -laR .
           SHA8="$(echo "${{ github.sha }}" | cut -c1-7)"
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             TAGS="-t ${IMAGE}:${GITHUB_REF_NAME} -t ${IMAGE}:sha-${SHA8}"
           else
             TAGS="-t ${IMAGE}:main -t ${IMAGE}:sha-${SHA8}"
           fi
-          docker buildx imagetools create $TAGS \
-            $(printf -- "--tag ${IMAGE}@sha256:%s " *)
+          args=("$TAGS")
+          for d in $(find . -type f -printf '%f\n'); do
+            args+=(-t "${IMAGE}@sha256:${d}")
+          done
+          docker buildx imagetools create "${args[@]}"
 
       - name: Inspect
         run: docker buildx imagetools inspect "${IMAGE}:main"
