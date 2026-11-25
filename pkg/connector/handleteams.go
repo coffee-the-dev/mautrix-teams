@@ -711,20 +711,19 @@ func (t *TeamsClient) convertIncomingMessage(
 		}}}, nil
 	}
 	content := msteams.ReplaceInlineEmojis(data.Content)
-	if data.MessageType == "RichText/Media_Card" {
-		// Element can't render Adaptive Cards; convert the URIObject-wrapped
-		// card payload to readable text instead of Teams' fallback line.
-		if plain, cardHTML, ok := msteams.RenderSwiftCards(content); ok {
-			cardContent := &event.MessageEventContent{MsgType: event.MsgText, Body: plain}
-			if cardHTML != "" && cardHTML != plain {
-				cardContent.Format = event.FormatHTML
-				cardContent.FormattedBody = cardHTML
-			}
-			return &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{
-				Type:    event.EventMessage,
-				Content: cardContent,
-			}}}, nil
+	// Element can't render Adaptive Cards; convert the URIObject-wrapped card
+	// payload to readable text instead of Teams' fallback line. Not gated on
+	// RichText/Media_Card: cards also arrive under other message types.
+	if plain, cardHTML, ok := msteams.RenderSwiftCards(content); ok {
+		cardContent := &event.MessageEventContent{MsgType: event.MsgText, Body: plain}
+		if cardHTML != "" && cardHTML != plain {
+			cardContent.Format = event.FormatHTML
+			cardContent.FormattedBody = cardHTML
 		}
+		return &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{
+			Type:    event.EventMessage,
+			Content: cardContent,
+		}}}, nil
 	}
 	parts := t.convertAttachments(ctx, intent, content)
 	parts = append(parts, t.convertSharedFiles(ctx, intent, data.SharedFiles)...)
